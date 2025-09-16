@@ -1,14 +1,4 @@
-# bot.py — Arbre généalogique "cute anime" (FR, simple)
-# discord.py 2.x + aiosqlite + Pillow
-# Commandes :
-#   /famille_creer nom:<texte> theme:<anime|kawaii|sakura|royal|neon|arabesque>
-#   /arbre [personne] [famille] [public]
-#   /lien_parente ajouter_parent|retirer_parent|lister
-#
-# ENV nécessaires :
-#   DISCORD_TOKEN=xxx
-#   GUILD_IDS=123456789012345678,987654321098765432  (ou GUILD_ID=…)
-#   LOGS_DEFAULT_CHAN_ID=1417304969333440553        (optionnel)
+# bot.py — Arbre généalogique "cute anime" (FR, simple & robuste)
 
 import os, io, time, asyncio, traceback
 from typing import Optional, List, Dict, Tuple
@@ -19,17 +9,14 @@ import aiohttp
 import aiosqlite
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
 
-# ------------- Config -------------
-DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
+# ============ CONFIG ============
+DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")  # requis
 GUILD_IDS = [int(x) for x in (os.getenv("GUILD_IDS") or os.getenv("GUILD_ID","")).replace(" ","").split(",") if x.strip().isdigit()]
-TARGET_GUILDS = [discord.Object(id=g) for g in GUILD_IDS]
-PRIMARY_GUILD = GUILD_IDS[0] if GUILD_IDS else None
-
 LOGS_DEFAULT_CHAN_ID = int(os.getenv("LOGS_DEFAULT_CHAN_ID", "1417304969333440553"))
 DB_PATH = os.getenv("DB_PATH", "./affiliations.db")
 BRAND_COLOR = 0xFF69B4  # rose cute
 
-# ------------- Thèmes (inclut "anime") -------------
+# Thèmes (inclut "anime")
 THEMES = {
     "anime":     {"bg":(255,249,254), "primary":(255,105,180), "line":(255,182,193), "card":(255,255,255)},  # cute / pastel
     "kawaii":    {"bg":(250,247,255), "primary":(124,58,237),  "line":(160,140,210), "card":(255,255,255)},
@@ -39,7 +26,7 @@ THEMES = {
     "arabesque": {"bg":(248,246,240), "primary":(189,119,26),  "line":(169,139,99),  "card":(255,255,252)},
 }
 
-# ------------- DB -------------
+# ============ DB ============
 CREATE_SQL = """
 PRAGMA journal_mode=WAL;
 
@@ -50,7 +37,7 @@ CREATE TABLE IF NOT EXISTS relations (
   name      TEXT,
   since     INTEGER,
   wallet_id TEXT,
-  theme     TEXT       -- <- nouveau : thème stocké sur la famille
+  theme     TEXT
 );
 
 CREATE TABLE IF NOT EXISTS relation_members (
@@ -80,31 +67,12 @@ async def db():
     conn.row_factory = aiosqlite.Row
     return conn
 
-async def _ensure_relations_theme_column():
-    async with await db() as conn:
-        cols = await (await conn.execute("PRAGMA table_info(relations)")).fetchall()
-        names = {c["name"] for c in cols}
-        if "theme" not in names:
-            try:
-                await conn.execute("ALTER TABLE relations ADD COLUMN theme TEXT")
-                await conn.commit()
-            except Exception:
-                pass
-
 async def init_db():
     async with await db() as conn:
         await conn.executescript(CREATE_SQL)
-        if PRIMARY_GUILD:
-            row = await (await conn.execute("SELECT 1 FROM guild_settings WHERE guild_id=?", (PRIMARY_GUILD,))).fetchone()
-            if not row:
-                await conn.execute(
-                    "INSERT INTO guild_settings(guild_id,theme,rtl,avatars,log_chan) VALUES (?,?,?,?,?)",
-                    (PRIMARY_GUILD, "anime", 0, 1, LOGS_DEFAULT_CHAN_ID)
-                )
         await conn.commit()
-    await _ensure_relations_theme_column()
 
-# ------------- Utils -------------
+# ============ UTILS ============
 def E(title: str, desc: str) -> discord.Embed:
     return discord.Embed(title=title, description=desc, color=BRAND_COLOR)
 
@@ -114,6 +82,21 @@ async def get_settings(guild_id:int) -> Dict[str,int|str|None]:
         if not row:
             return {"guild_id": guild_id, "theme": "anime", "rtl": 0, "avatars": 1, "log_chan": LOGS_DEFAULT_CHAN_ID}
         return dict(row)
+
+async def set_setting(guild_id:int, key:str, value):
+    async with await db() as conn:
+        row = await (await conn.execute("SELECT 1 FROM guild_settings WHERE guild_id=?", (guild_id,))).fetchone()
+        if row:
+            await conn.execute(f"UPDATE guild_settings SET {key}=? WHERE guild_id=?", (value, guild_id))
+        else:
+            await conn.execute(
+                "INSERT INTO guild_settings(guild_id,theme,rtl,avatars,log_chan) VALUES (?,?,?,?,?)",
+                (guild_id,
+                 value if key=="theme" else "anime",
+                 int(value) if key=="rtl" else 0,
+                 int(value) if key=="avatars" else 1,
+                 int(value) if key=="log_chan" else LOGS_DEFAULT_CHAN_ID))
+        await conn.commit()
 
 async def log_line(guild: discord.Guild, text: str):
     try:
@@ -135,7 +118,7 @@ def deterministic_rel_id(members: List[int]) -> str:
     base = ":".join(map(str, sorted(set(members))))
     return f"family:{int(time.time())}:{base[:6]}"
 
-# ------------- Familles -------------
+# ============ FAMILLES ============
 async def create_family(guild_id:int, creator_id:int, name:str, theme:str="anime") -> str:
     theme = theme if theme in THEMES else "anime"
     rel_id = deterministic_rel_id([creator_id])
@@ -186,7 +169,7 @@ async def ac_familles(inter: discord.Interaction, current: str):
     except Exception:
         return []
 
-# ------------- Parentes (facultatif) -------------
+# ============ PARENTÉS ============
 async def add_parent(child_id:int, parent_id:int):
     async with await db() as conn:
         await conn.execute("INSERT OR IGNORE INTO kin_edges(parent_id, child_id) VALUES (?,?)", (parent_id, child_id))
@@ -197,7 +180,7 @@ async def remove_parent(child_id:int, parent_id:int):
         await conn.execute("DELETE FROM kin_edges WHERE parent_id=? AND child_id=?", (parent_id, child_id))
         await conn.commit()
 
-# ------------- Rendu arbre -------------
+# ============ RENDU ARBRE ============
 def _measure(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.FreeTypeFont):
     try:
         x0,y0,x1,y1 = draw.textbbox((0,0), text, font=font)
@@ -232,7 +215,6 @@ def _quad(p0,p1,p2,steps=32):
     return pts
 
 async def render_tree_png(guild: discord.Guild, relation_id: str, rtl=False, show_avatars=True, res:int=1, fallback_theme:str="anime") -> bytes:
-    # lire famille + thème + membres + arêtes
     async with await db() as conn:
         fam = await (await conn.execute("SELECT name, theme FROM relations WHERE rel_id=? AND rtype='family'", (relation_id,))).fetchone()
         if not fam: raise ValueError("Famille introuvable")
@@ -246,7 +228,6 @@ async def render_tree_png(guild: discord.Guild, relation_id: str, rtl=False, sho
     theme = THEMES.get(theme_name, THEMES["anime"])
     if not members: raise ValueError("La famille n'a pas de membres")
 
-    # niveaux
     parents_of: Dict[int, List[int]] = {m: [] for m in members}
     for p,c in edges:
         parents_of.setdefault(c, []).append(p)
@@ -268,9 +249,8 @@ async def render_tree_png(guild: discord.Guild, relation_id: str, rtl=False, sho
     for u,d in depth_cache.items():
         by_level.setdefault(d, []).append(u)
         max_level = max(max_level, d)
-    for d in by_level: by_level[d].sort(reverse=rtl)
+    for d in by_level: by_level[d].sort()
 
-    # géométrie
     margin_x, margin_y = 120, 140
     cell_w, cell_h = 320, 220
     card_w, card_h = 260, 108
@@ -303,7 +283,6 @@ async def render_tree_png(guild: discord.Guild, relation_id: str, rtl=False, sho
             cy = (margin_y + lvl*cell_h + cell_h//2) * res
             positions[uid] = (cx,cy)
 
-    # liens
     for (p,c) in edges:
         if p not in positions or c not in positions: continue
         px,py = positions[p]; cx,cy = positions[c]
@@ -311,18 +290,15 @@ async def render_tree_png(guild: discord.Guild, relation_id: str, rtl=False, sho
         pts=_quad((px,py+card_h//2*res), ctrl, (cx,cy-card_h//2*res), steps=36)
         draw.line(pts, fill=theme["line"], width=4*res)
 
-    # cartes
     async def card(uid:int):
         cx,cy=positions[uid]
         x0 = cx - card_w//2*res; y0 = cy - card_h//2*res
         x1 = cx + card_w//2*res; y1 = cy + card_h//2*res
-        # ombre
         sh = Image.new("RGBA", (int(card_w*res+18*res), int(card_h*res+18*res)), (0,0,0,0))
         d2 = ImageDraw.Draw(sh)
         d2.rounded_rectangle((9*res,9*res, card_w*res+9*res, card_h*res+9*res), radius=22*res, fill=(0,0,0,85))
         sh = sh.filter(ImageFilter.GaussianBlur(8*res))
         bg.alpha_composite(sh, (int(x0-9*res), int(y0-9*res)))
-        # carte
         draw.rounded_rectangle([x0,y0,x1,y1], radius=22*res, outline=theme["primary"], width=3*res, fill=theme["card"])
 
         name = str(uid)
@@ -350,17 +326,21 @@ async def render_tree_png(guild: discord.Guild, relation_id: str, rtl=False, sho
     bg.save(b, format="PNG", optimize=True)
     return b.getvalue()
 
-# ------------- Discord setup -------------
+# ============ DISCORD ============
 intents = discord.Intents.default()
 intents.guilds = True
 intents.members = True
 bot = discord.Client(intents=intents)
 tree = app_commands.CommandTree(bot)
 
-# ------------- Commandes -------------
-@tree.command(name="famille_creer", description="Créer une famille (avec thème cute).", guilds=TARGET_GUILDS)
+# ---- commandes de base
+@tree.command(name="ping", description="Test de présence (répond tout de suite).")
+async def ping(inter: discord.Interaction):
+    await reply(inter, content="pong ✅", ephemeral=True)
+
+@tree.command(name="famille_creer", description="Créer une famille (avec thème cute).")
 @app_commands.describe(nom="Nom de la famille", theme="Thème (anime/kawaii/sakura/royal/neon/arabesque)")
-async def famille_creer(inter: discord.Interaction, nom: str, theme: str = "anime"):
+async def famille_creer_cmd(inter: discord.Interaction, nom: str, theme: str = "anime"):
     try:
         if theme not in THEMES:
             await reply(inter, content="Thèmes valides : " + ", ".join(THEMES.keys()), ephemeral=True); return
@@ -370,19 +350,18 @@ async def famille_creer(inter: discord.Interaction, nom: str, theme: str = "anim
     except Exception as e:
         await reply(inter, content=f"⚠️ {e}", ephemeral=True)
 
-@tree.command(name="arbre", description="Affiche l'arbre généalogique (auto : ta famille).", guilds=TARGET_GUILDS)
+@tree.command(name="arbre", description="Affiche l'arbre généalogique (auto : ta famille).")
 @app_commands.describe(
     famille="Choisir une famille (autocomplétion)",
     personne="Afficher la famille de cette personne",
     public="Poster publiquement (sinon en privé)"
 )
 @app_commands.autocomplete(famille=ac_familles)
-async def arbre(inter: discord.Interaction,
-                famille: Optional[str] = None,
-                personne: Optional[discord.Member] = None,
-                public: bool = False):
+async def arbre_cmd(inter: discord.Interaction,
+                    famille: Optional[str] = None,
+                    personne: Optional[discord.Member] = None,
+                    public: bool = False):
     try:
-        # cible
         if famille:
             rel_id = famille
         elif personne:
@@ -410,8 +389,8 @@ async def arbre(inter: discord.Interaction,
         await reply(inter, content=f"⚠️ Erreur: {e}", ephemeral=True)
         traceback.print_exc()
 
-# Parentes (optionnel mais utile pour des liens visuels)
-g_kin = app_commands.Group(name="lien_parente", description="Gérer parent/enfant", guild_ids=GUILD_IDS)
+# groupe parenté
+g_kin = app_commands.Group(name="lien_parente", description="Gérer parent/enfant")
 
 @g_kin.command(name="ajouter_parent", description="Définir un parent pour un enfant (admin)")
 @app_commands.checks.has_permissions(administrator=True)
@@ -437,21 +416,30 @@ async def lister_parente_cmd(inter: discord.Interaction, user: discord.Member):
 
 tree.add_command(g_kin)
 
-# ------------- Lifecycle -------------
+# ============ LIFECYCLE ============
 @bot.event
 async def on_ready():
     try:
+        await init_db()
+        # Sync global + push rapide en guilds présentes
+        await tree.sync()
         for g in bot.guilds:
             await tree.sync(guild=g)
-        print("Slash sync OK (guild-only).")
+        print("Slash sync OK.")
     except Exception as e:
         print("Sync error:", e)
     print(f"Connecté en {bot.user} — guilds: {[g.id for g in bot.guilds]}")
 
+@bot.event
+async def on_guild_join(guild: discord.Guild):
+    try:
+        await tree.sync(guild=guild)
+    except Exception as e:
+        print("Sync on join error:", e)
+
 async def main():
     if not DISCORD_TOKEN:
         raise RuntimeError("DISCORD_TOKEN manquant")
-    await init_db()
     await bot.start(DISCORD_TOKEN)
 
 if __name__ == "__main__":
