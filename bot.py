@@ -1,4 +1,3 @@
-
 import os, asyncio, time, io
 from typing import Optional, List, Tuple, Dict
 
@@ -311,6 +310,22 @@ async def dissolve_relation(rel_id: str, split_evenly: bool=True, percent_for_a:
         await conn.execute("DELETE FROM relation_members WHERE rel_id=?", (rel_id,))
         await conn.execute("DELETE FROM relations WHERE rel_id=?", (rel_id,))
         await conn.commit()
+
+# >>>>>>>>>>>>>>>> FIX #1 — fonction manquante pour le divorce
+async def get_marriage_rel_id(guild_id: int, a_id: int, b_id: int) -> Optional[str]:
+    async with await db() as conn:
+        q = """
+        SELECT r.rel_id
+        FROM relations r
+        JOIN relation_members m1 ON r.rel_id = m1.rel_id
+        JOIN relation_members m2 ON r.rel_id = m2.rel_id
+        WHERE r.guild_id = ? AND r.rtype = 'marriage'
+          AND m1.user_id = ? AND m2.user_id = ?
+        LIMIT 1
+        """
+        row = await (await conn.execute(q, (guild_id, a_id, b_id))).fetchone()
+        return row["rel_id"] if row else None
+# <<<<<<<<<<<<<<<<
 
 # ---------------- Arbre (rendu) ----------------
 def _measure(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.FreeTypeFont):
@@ -640,10 +655,12 @@ async def famille_creer(interaction: discord.Interaction, nom: str, wallet: bool
 @tree.command(name="famille_inviter", description="Inviter quelqu'un dans une famille", guild=discord.Object(id=GUILD_ID))
 async def famille_inviter(interaction: discord.Interaction, relation_id: str, membre: discord.Member):
     e = E("👪 Invitation famille", f"{interaction.user.mention} invite {membre.mention} à rejoindre `{relation_id}`.")
-    await interaction.response.send_message(embed=e, view=discord.ui.View())
-    await interaction.edit_original_response(view=None)
-    # On envoie une vraie vue d'invitation distincte pour ne pas limiter à l'auteur
+    # >>>>>>>>>>>>>>>> FIX #2 — ajouter les boutons AVANT l'envoi
     v = discord.ui.View(timeout=240)
+
+    btn_ok = discord.ui.Button(label="👪 Rejoindre", style=discord.ButtonStyle.success)
+    btn_ref = discord.ui.Button(label="❌ Refuser", style=discord.ButtonStyle.secondary)
+
     async def join_callback(inter: discord.Interaction):
         if inter.user.id != membre.id:
             await inter.response.send_message("❌ Seule la personne invitée peut répondre.", ephemeral=True); return
@@ -651,18 +668,21 @@ async def famille_inviter(interaction: discord.Interaction, relation_id: str, me
             await add_member_to_family(relation_id, membre.id)
             await inter.response.edit_message(content=f"✅ {membre.mention} a rejoint `{relation_id}`.", view=None)
             await log_line(inter.guild, f"👪 {membre.mention} a rejoint `{relation_id}`")
-        except Exception as e:
-            await inter.response.send_message(f"⚠️ Impossible: {e}", ephemeral=True)
+        except Exception as ex:
+            await inter.response.send_message(f"⚠️ Impossible: {ex}", ephemeral=True)
+
     async def refuse_callback(inter: discord.Interaction):
         if inter.user.id != membre.id:
             await inter.response.send_message("❌ Seule la personne invitée peut répondre.", ephemeral=True); return
         await inter.response.edit_message(content="🙅 Invitation refusée.", view=None)
-    btn_ok = discord.ui.Button(label="👪 Rejoindre", style=discord.ButtonStyle.success)
-    btn_ref = discord.ui.Button(label="❌ Refuser", style=discord.ButtonStyle.secondary)
+
     btn_ok.callback = join_callback
     btn_ref.callback = refuse_callback
-    await interaction.followup.send(embed=e, view=v)
-    v.add_item(btn_ok); v.add_item(btn_ref)
+    v.add_item(btn_ok)
+    v.add_item(btn_ref)
+
+    await interaction.response.send_message(embed=e, view=v)
+    # <<<<<<<<<<<<<<<<
 
 # Groupe liens de parenté
 groupe_kin = app_commands.Group(name="lien_parente", description="Liens de parenté", guild_ids=[GUILD_ID])
