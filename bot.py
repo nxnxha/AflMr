@@ -1,9 +1,9 @@
-# bot.py — Affiliations FR (UHQ) — FIX: pas de double enregistrement de commandes
+# bot.py — Affiliations FR (UHQ) — guild-only + sync propre
 # - Mariage/ami/frère-soeur/famille + wallets partagés
 # - Contrat de mariage + historique par famille
-# - Arbre généalogique (nom de famille, pas d'IDs visibles)
+# - Arbre généalogique (nom de famille, pas d'IDs)
 # - API FastAPI /v1 pour intégrations casino/coins
-# - Slash commands FR + sync multi-guild sans doublons
+# - Slash commands FR en guild-only (instantané)
 
 import os, asyncio, time, io
 from typing import Optional, List, Tuple, Dict
@@ -22,7 +22,12 @@ load_dotenv()
 
 # ---------------- Config ----------------
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
-GUILD_ID_ENV  = int(os.getenv("GUILD_ID", "0")) or None  # uniquement pour seed défauts
+
+# Guilds ciblées pour les slash (instantané). Mets GUILD_IDS="123,456" ou GUILD_ID="123"
+GUILD_IDS = [int(x) for x in (os.getenv("GUILD_IDS") or os.getenv("GUILD_ID","")).replace(" ","").split(",") if x.strip().isdigit()]
+TARGET_GUILDS = [discord.Object(id=g) for g in GUILD_IDS]
+GUILD_ID_ENV  = GUILD_IDS[0] if GUILD_IDS else None  # pour seeds de défauts
+
 API_HOST      = os.getenv("API_HOST", "0.0.0.0")
 API_BASE      = os.getenv("API_BASE", "/v1")
 API_PORT      = int(os.getenv("PORT") or os.getenv("API_PORT") or "8000")
@@ -40,7 +45,7 @@ EPIC_SPEND_MODE       = os.getenv("EPIC_SPEND_MODE", "add_negative")  # add_nega
 
 DB_PATH = os.getenv("DB_PATH", "./affiliations.db")
 BRAND_COLOR = 0x7C3AED
-LOGS_DEFAULT_CHAN_ID = 1417304969333440553
+LOGS_DEFAULT_CHAN_ID = int(os.getenv("LOGS_DEFAULT_CHAN_ID", "1417304969333440553"))
 
 # secret runtime (modifiable par commande)
 RUNTIME_SECRET: Optional[str] = None
@@ -163,7 +168,7 @@ async def db():
 async def init_db():
     conn = await db()
     await conn.executescript(CREATE_SQL)
-    # seed owners + settings par défaut (si GUILD_ID_ENV fourni)
+    # seeds si GUILD_ID_ENV fourni
     if GUILD_ID_ENV:
         for uid in OWNER_IDS_ENV:
             await conn.execute("INSERT OR IGNORE INTO owners(guild_id,user_id) VALUES (?,?)", (GUILD_ID_ENV, int(uid)))
@@ -440,7 +445,7 @@ async def maj_contrat_status(cid: str, status: str):
         await conn.commit()
     await log_contract_event(cid, "divorce", f"Statut: {status}")
 
-# ---------------- Résolution famille (nom/ID) ----------------
+# ---------------- Famille: résolution nom/ID ----------------
 async def resolve_family_rel_id(guild_id:int, key:str) -> Optional[str]:
     key = (key or "").strip()
     async with await db() as conn:
@@ -585,7 +590,7 @@ async def render_family_tree_png(guild: Optional[discord.Guild], relation_id: st
         font_name  = ImageFont.load_default()
         font_meta  = ImageFont.load_default()
 
-    # title (nom de famille, pas l'ID)
+    # title (nom de famille)
     title = f"Arbre généalogique — {fam_name}"
     tw, th = _measure(draw, title, font_title)
     draw.text(((width-tw)//2, 24*res), title, fill=(60,60,90), font=font_title)
@@ -621,7 +626,7 @@ async def render_family_tree_png(guild: Optional[discord.Guild], relation_id: st
         bg.alpha_composite(shadow, (int(x0-9*res), int(y0-9*res)))
         # card
         draw.rounded_rectangle([x0,y0,x1,y1], radius=22*res, outline=theme["primary"], width=3*res, fill=theme["card"])
-        # avatar + nom (pas d'ID visible)
+        # avatar + nom
         ax = x0 + 14*res; ay = y0 + (card_h*res - (avatar_size*res if show_avatars else 0))//2
         display_name = str(uid)
         if guild:
@@ -652,7 +657,7 @@ async def render_family_tree_png(guild: Optional[discord.Guild], relation_id: st
 # ---------------- Discord bot ----------------
 intents = discord.Intents.default()
 intents.guilds = True
-intents.members = True  # pour noms/avatars dans l'arbre
+intents.members = True  # pour noms/avatars
 bot = discord.Client(intents=intents)
 tree = app_commands.CommandTree(bot)
 
@@ -755,8 +760,8 @@ class VueDivorce(discord.ui.View):
         await interaction.response.edit_message(content="❌ Divorce annulé (contrat rejeté).", view=None)
         await log_line(interaction.guild, f"🛑 Divorce {self.contrat_id}: rejeté par {interaction.user.mention}")
 
-# ---------------- Slash FR ----------------
-@tree.command(name="proposer_relation", description="Proposer une relation (mariage|ami|frere_soeur)")
+# ---------------- Slash FR (GUILD-ONLY) ----------------
+@tree.command(name="proposer_relation", description="Proposer une relation (mariage|ami|frere_soeur)", guilds=TARGET_GUILDS)
 @app_commands.describe(membre="Membre", type="mariage|ami|frere_soeur", wallet="Créer un wallet commun ?")
 async def proposer_relation(interaction: discord.Interaction, membre: discord.Member, type: str, wallet: bool = True):
     mapping = {"mariage":"marriage","ami":"friend","frere_soeur":"sibling"}
@@ -785,13 +790,13 @@ async def proposer_relation(interaction: discord.Interaction, membre: discord.Me
     e = E("🔗 Demande de relation", desc)
     await interaction.response.send_message(embed=e, view=VueRelation(rtype, interaction.user.id, membre.id, wallet, contrat_id=contrat_id))
 
-@tree.command(name="famille_creer", description="Créer une famille (multi-membres)")
+@tree.command(name="famille_creer", description="Créer une famille (multi-membres)", guilds=TARGET_GUILDS)
 async def famille_creer(interaction: discord.Interaction, nom: str, wallet: bool = True):
     rid = await create_relation(interaction.guild.id, "family", [interaction.user.id], with_wallet=wallet, name=nom)
     await interaction.response.send_message(f"👪 Famille **{nom}** créée (id=`{rid}`).", ephemeral=True)
     await log_line(interaction.guild, f"👪 Famille créée `{rid}` par {interaction.user.mention}")
 
-@tree.command(name="famille_inviter", description="Inviter quelqu'un dans une famille")
+@tree.command(name="famille_inviter", description="Inviter quelqu'un dans une famille", guilds=TARGET_GUILDS)
 async def famille_inviter(interaction: discord.Interaction, relation_id: str, membre: discord.Member):
     e = E("👪 Invitation famille", f"{interaction.user.mention} invite {membre.mention} à rejoindre `{relation_id}`.")
     v = discord.ui.View(timeout=240)
@@ -818,8 +823,8 @@ async def famille_inviter(interaction: discord.Interaction, relation_id: str, me
     v.add_item(btn_ok); v.add_item(btn_ref)
     await interaction.response.send_message(embed=e, view=v)
 
-# Groupe liens de parenté
-groupe_kin = app_commands.Group(name="lien_parente", description="Liens de parenté")
+# Groupe liens de parenté (guild-only)
+groupe_kin = app_commands.Group(name="lien_parente", description="Liens de parenté", guild_ids=GUILD_IDS)
 
 @groupe_kin.command(name="ajouter_parent", description="Définir un parent pour un enfant (admin)")
 @app_commands.checks.has_permissions(administrator=True)
@@ -847,8 +852,8 @@ async def lister_parente(interaction: discord.Interaction, user: discord.Member)
     ctxt = ", ".join([ (g.get_member(int(r["child_id"])).mention if g.get_member(int(r["child_id"])) else f"`{r['child_id']}`") for r in enfants]) or "—"
     await interaction.response.send_message(f"👨‍👩‍👧 **Parents**: {ptxt}\n👶 **Enfants**: {ctxt}", ephemeral=True)
 
-# -------- Réglages --------
-groupe_reglages = app_commands.Group(name="reglages_aff", description="Réglages du bot d'affiliation")
+# -------- Réglages (guild-only) --------
+groupe_reglages = app_commands.Group(name="reglages_aff", description="Réglages du bot d'affiliation", guild_ids=GUILD_IDS)
 
 @groupe_reglages.command(name="definir_theme", description="Définir le thème de l'arbre")
 @app_commands.describe(theme="kawaii|sakura|royal|neon|arabesque")
@@ -877,8 +882,8 @@ async def definir_salon_logs(interaction: discord.Interaction, salon: discord.Te
     await set_setting(interaction.guild.id, "log_chan", int(salon.id))
     await interaction.response.send_message(f"🪵 Logs → {salon.mention}", ephemeral=True)
 
-# -------- Propriétaires --------
-groupe_owner = app_commands.Group(name="proprietaires", description="Contrôle propriétaire")
+# -------- Propriétaires (guild-only) --------
+groupe_owner = app_commands.Group(name="proprietaires", description="Contrôle propriétaire", guild_ids=GUILD_IDS)
 
 @groupe_owner.command(name="ajouter", description="Ajouter un propriétaire")
 @owner_check()
@@ -940,8 +945,70 @@ tree.add_command(groupe_kin)
 tree.add_command(groupe_reglages)
 tree.add_command(groupe_owner)
 
-# -------- Historique contrats par famille --------
-@tree.command(name="contrat_historique_famille", description="Historique mariages/divorces liés aux membres d'une famille (nom ou ID)")
+# -------- Historique contrats / Arbre / Divorce (guild-only) --------
+@tree.command(name="arbre_famille", description="Générer une image UHQ de la famille", guilds=TARGET_GUILDS)
+@app_commands.describe(relation_id="ID ou nom de famille (family)", theme="kawaii|sakura|royal|neon|arabesque", rtl="Mode droite→gauche", avatars="Montrer les avatars", res="1..3", public="Poster publiquement")
+async def arbre_famille(interaction: discord.Interaction, relation_id: str, theme: str = None, rtl: bool = None, avatars: bool = None, res: int = 1, public: bool = False):
+    # Accepte aussi le nom de famille
+    rid = await resolve_family_rel_id(interaction.guild.id, relation_id) or relation_id
+    sett = await get_settings(interaction.guild.id)
+    theme_name = (theme or sett.get("theme") or "kawaii")
+    rtl_flag   = bool(sett.get("rtl")) if rtl is None else rtl
+    show_av    = bool(sett.get("avatars",1)) if avatars is None else avatars
+    res = max(1, min(3, int(res)))
+    try:
+        png = await render_family_tree_png(interaction.guild, rid, theme_name=theme_name, rtl=rtl_flag, show_avatars=show_av, res=res)
+    except Exception as e:
+        await interaction.response.send_message(f"⚠️ {e}", ephemeral=True); return
+    file = discord.File(io.BytesIO(png), filename=f"arbre_{rid}_{theme_name}@{res}x.png")
+    await interaction.response.send_message(file=file, ephemeral=not public)
+
+@tree.command(name="proposer_divorce", description="Proposer un divorce (contrat + split wallet + pénalité coins)", guilds=TARGET_GUILDS)
+@app_commands.describe(
+    partenaire="La personne à divorcer (vous devez être mariés)",
+    split_mode="egal|pourcentage",
+    percent_pour_toi="Si 'pourcentage' : % du wallet pour toi (0..100)",
+    penalite_coins="Pénalité en coins (A→B) si acceptée (0 pour aucune)",
+    payeur_cest_moi="Si pénalité > 0: True=toi paies, False=partenaire",
+    expire_minutes="Durée de validité du contrat (min)"
+)
+async def proposer_divorce(
+    interaction: discord.Interaction,
+    partenaire: discord.Member,
+    split_mode: str = "egal",
+    percent_pour_toi: int = 50,
+    penalite_coins: int = 0,
+    payeur_cest_moi: bool = True,
+    expire_minutes: int = 60
+):
+    mode_int = {"egal":"equal","pourcentage":"percent"}.get(split_mode)
+    if mode_int is None:
+        await interaction.response.send_message("split_mode doit être 'egal' ou 'pourcentage'.", ephemeral=True); return
+    if mode_int=="percent" and not (0 <= percent_pour_toi <= 100):
+        await interaction.response.send_message("percent_pour_toi doit être entre 0 et 100.", ephemeral=True); return
+    if interaction.user.id == partenaire.id:
+        await interaction.response.send_message("… tu ne peux pas divorcer de toi-même 😅", ephemeral=True); return
+    rid = await get_marriage_rel_id(interaction.guild.id, interaction.user.id, partenaire.id)
+    if not rid:
+        await interaction.response.send_message("❌ Vous n'êtes pas mariés (dans ce bot).", ephemeral=True); return
+    a_id = interaction.user.id
+    b_id = partenaire.id
+    percent_for_a = percent_pour_toi if mode_int=="percent" else 50
+    penalty_from = a_id if payeur_cest_moi else b_id
+    penalty_to   = b_id if payeur_cest_moi else a_id
+    cid = await creer_contrat_divorce(interaction.guild.id, a_id, b_id, mode_int, percent_for_a, penalty_from, penalty_to, int(max(0,penalite_coins)), int(max(5,expire_minutes)))
+
+    desc = [f"**Divorce proposé par {interaction.user.mention}** avec {partenaire.mention}",
+            f"- Relation: `mariage` → `{rid}`",
+            f"- Répartition wallet: `{split_mode}`" + (f" — **{percent_for_a}%** pour {interaction.user.mention}" if mode_int=='percent' else ""),
+            f"- Pénalité coins: **{int(max(0,penalite_coins))}** de {'toi' if payeur_cest_moi else 'lui/elle'} vers {'lui/elle' if payeur_cest_moi else 'toi'}",
+            f"- Expire dans **{int(max(5,expire_minutes))} min**",
+            f"- Contrat: `{cid}`" ]
+    e = E("💔 Contrat de divorce", "\n".join(desc))
+    await interaction.response.send_message(content=f"{interaction.user.mention} {partenaire.mention}", embed=e, view=VueDivorce(cid, a_id, b_id))
+    await log_line(interaction.guild, f"📄 Nouveau contrat de divorce `{cid}` entre {interaction.user.mention} et {partenaire.mention}")
+
+@tree.command(name="contrat_historique_famille", description="Historique mariages/divorces liés aux membres d'une famille (nom ou ID)", guilds=TARGET_GUILDS)
 @app_commands.describe(famille="Nom de la famille ou ID relation (family:...)")
 async def contrat_historique_famille(interaction: discord.Interaction, famille: str):
     rel_id = await resolve_family_rel_id(interaction.guild.id, famille)
@@ -998,14 +1065,14 @@ async def contrat_historique_famille(interaction: discord.Interaction, famille: 
 # ---------------- Bot lifecycle ----------------
 @bot.event
 async def on_ready():
-    # Sync commandes pour TOUS les serveurs où le bot est présent, sans duplication
+    # Sync commandes pour TOUS les serveurs ciblés / où le bot est
     try:
         for g in bot.guilds:
             try:
-                await tree.sync(guild=g)   # sync "guild" → visible immédiat
+                await tree.sync(guild=g)
             except Exception as eg:
                 print("Sync guild error:", g.id, eg)
-        print("Slash FR sync OK (multi-guild)")
+        print("Slash FR sync OK (guild-only)")
     except Exception as e:
         print("Sync error:", e)
     print(f"Bot connecté: {bot.user} — guilds: {[g.id for g in bot.guilds]}")
