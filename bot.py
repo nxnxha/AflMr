@@ -1,4 +1,4 @@
-import os, asyncio, io, time
+import os, asyncio, io
 import discord
 from discord import app_commands
 from dotenv import load_dotenv
@@ -9,10 +9,6 @@ load_dotenv()
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 GUILD_ID = int(os.getenv("GUILD_ID", "0"))
-
-# Coins Epic API
-EPIC_BASE_URL = os.getenv("EPIC_BASE_URL", "")
-EPIC_API_KEY = os.getenv("EPIC_API_KEY", "")
 
 DB_PATH = "./affiliations.db"
 THEMES = {
@@ -44,24 +40,32 @@ intents = discord.Intents.default()
 bot = discord.Client(intents=intents)
 tree = app_commands.CommandTree(bot)
 
+# Commande test /ping
+@tree.command(name="ping", description="Tester si le bot répond", guild=discord.Object(id=GUILD_ID))
+async def ping(inter: discord.Interaction):
+    await inter.response.send_message("🏓 Pong ! Le bot est bien en ligne.")
+
 @tree.command(name="proposer_mariage", description="Proposer un mariage", guild=discord.Object(id=GUILD_ID))
 async def proposer_mariage(inter: discord.Interaction, membre: discord.Member):
+    await inter.response.defer()
     if membre.id == inter.user.id:
-        await inter.response.send_message("❌ Tu ne peux pas te marier avec toi-même.", ephemeral=True)
+        await inter.followup.send("❌ Tu ne peux pas te marier avec toi-même.")
         return
-    await inter.response.send_message(f"💍 {inter.user.mention} propose un mariage à {membre.mention}")
+    await inter.followup.send(f"💍 {inter.user.mention} propose un mariage à {membre.mention}")
 
 @tree.command(name="famille_creer", description="Créer une famille", guild=discord.Object(id=GUILD_ID))
 async def famille_creer(inter: discord.Interaction, nom: str, theme: str="kawaii"):
+    await inter.response.defer()
     theme = theme if theme in THEMES else "kawaii"
     file = await create_image(theme, f"Famille {nom}")
-    await inter.response.send_message(content=f"👪 Famille **{nom}** créée avec le thème **{theme}**", file=file)
+    await inter.followup.send(content=f"👪 Famille **{nom}** créée avec le thème **{theme}**", file=file)
 
 @tree.command(name="arbre_famille", description="Afficher l'arbre de famille", guild=discord.Object(id=GUILD_ID))
 async def arbre_famille(inter: discord.Interaction, nom: str, theme: str="kawaii"):
+    await inter.response.defer()
     theme = theme if theme in THEMES else "kawaii"
     file = await create_image(theme, f"Arbre: {nom}")
-    await inter.response.send_message(file=file)
+    await inter.followup.send(file=file)
 
 @bot.event
 async def on_ready():
