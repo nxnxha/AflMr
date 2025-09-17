@@ -1,148 +1,77 @@
-import os, asyncio, time, io, aiosqlite
+import os, asyncio, io, time
 import discord
 from discord import app_commands
-from discord.ext import commands
 from dotenv import load_dotenv
+import aiosqlite
+from PIL import Image, ImageDraw, ImageFont
 
 load_dotenv()
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
-GUILD_ID      = int(os.getenv("GUILD_ID", "0"))
+GUILD_ID = int(os.getenv("GUILD_ID", "0"))
 
-# DB sur Railway (stockage temporaire → persiste tant que le conteneur tourne)
-DB_PATH = "/tmp/affiliations_simple.db"
+# Coins Epic API
+EPIC_BASE_URL = os.getenv("EPIC_BASE_URL", "")
+EPIC_API_KEY = os.getenv("EPIC_API_KEY", "")
 
-# ---------- DB ----------
-CREATE_SQL = """
-CREATE TABLE IF NOT EXISTS mariages (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user1 INTEGER,
-    user2 INTEGER,
-    date INTEGER
-);
-CREATE TABLE IF NOT EXISTS familles (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    nom TEXT,
-    createur INTEGER,
-    date INTEGER
-);
-"""
+DB_PATH = "./affiliations.db"
+THEMES = {
+    "kawaii": {"bg":(250,247,255), "line":(124,58,237)},
+    "sakura": {"bg":(255,247,251), "line":(221,73,104)},
+    "royal": {"bg":(245,246,252), "line":(66,90,188)},
+    "neon": {"bg":(18,18,22), "line":(0,245,212)},
+    "arabesque": {"bg":(248,246,240), "line":(189,119,26)}
+}
 
 async def init_db():
-    async with aiosqlite.connect(DB_PATH) as conn:
-        await conn.executescript(CREATE_SQL)
-        await conn.commit()
-    print("✅ DB initialisée")
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("CREATE TABLE IF NOT EXISTS mariages (id INTEGER PRIMARY KEY AUTOINCREMENT, user1 INTEGER, user2 INTEGER, since INTEGER)")
+        await db.execute("CREATE TABLE IF NOT EXISTS familles (id INTEGER PRIMARY KEY AUTOINCREMENT, nom TEXT, createur INTEGER, since INTEGER)")
+        await db.commit()
 
-# ---------- BOT ----------
+async def create_image(theme: str, titre: str) -> discord.File:
+    t = THEMES.get(theme, THEMES["kawaii"])
+    img = Image.new("RGB", (500,300), t["bg"])
+    d = ImageDraw.Draw(img)
+    fnt = ImageFont.load_default()
+    d.text((20,140), titre, fill=t["line"], font=fnt)
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    buf.seek(0)
+    return discord.File(buf, filename="arbre.png")
+
 intents = discord.Intents.default()
-intents.guilds = True
-bot = commands.Bot(command_prefix="!", intents=intents)
-tree = bot.tree
+bot = discord.Client(intents=intents)
+tree = app_commands.CommandTree(bot)
 
-# ---------- COMMANDES ----------
-@tree.command(name="proposer_relation", description="Proposer un mariage")
-async def proposer_relation(inter: discord.Interaction, membre: discord.Member):
+@tree.command(name="proposer_mariage", description="Proposer un mariage", guild=discord.Object(id=GUILD_ID))
+async def proposer_mariage(inter: discord.Interaction, membre: discord.Member):
     if membre.id == inter.user.id:
-        await inter.response.send_message("😅 Tu ne peux pas te marier avec toi-même.", ephemeral=True)
+        await inter.response.send_message("❌ Tu ne peux pas te marier avec toi-même.", ephemeral=True)
         return
+    await inter.response.send_message(f"💍 {inter.user.mention} propose un mariage à {membre.mention}")
 
-    # Vérifier si déjà marié
-    async with aiosqlite.connect(DB_PATH) as conn:
-        row = await (await conn.execute(
-            "SELECT 1 FROM mariages WHERE user1=? OR user2=?", (inter.user.id, inter.user.id)
-        )).fetchone()
-        if row:
-            await inter.response.send_message("❌ Tu es déjà marié.", ephemeral=True)
-            return
+@tree.command(name="famille_creer", description="Créer une famille", guild=discord.Object(id=GUILD_ID))
+async def famille_creer(inter: discord.Interaction, nom: str, theme: str="kawaii"):
+    theme = theme if theme in THEMES else "kawaii"
+    file = await create_image(theme, f"Famille {nom}")
+    await inter.response.send_message(content=f"👪 Famille **{nom}** créée avec le thème **{theme}**", file=file)
 
-    embed = discord.Embed(
-        title="💍 Demande en mariage",
-        description=f"{inter.user.mention} demande {membre.mention} en mariage !",
-        color=0xFFC0CB
-    )
-    view = discord.ui.View()
+@tree.command(name="arbre_famille", description="Afficher l'arbre de famille", guild=discord.Object(id=GUILD_ID))
+async def arbre_famille(inter: discord.Interaction, nom: str, theme: str="kawaii"):
+    theme = theme if theme in THEMES else "kawaii"
+    file = await create_image(theme, f"Arbre: {nom}")
+    await inter.response.send_message(file=file)
 
-    async def accepter_callback(i: discord.Interaction):
-        if i.user.id != membre.id:
-            await i.response.send_message("❌ Ce bouton n'est pas pour toi.", ephemeral=True)
-            return
-        async with aiosqlite.connect(DB_PATH) as conn:
-            await conn.execute(
-                "INSERT INTO mariages (user1, user2, date) VALUES (?,?,?)",
-                (inter.user.id, membre.id, int(time.time()))
-            )
-            await conn.commit()
-        await i.response.edit_message(content="🎉 Félicitations ! Vous êtes mariés 💕", view=None)
-
-    async def refuser_callback(i: discord.Interaction):
-        if i.user.id != membre.id:
-            await i.response.send_message("❌ Ce bouton n'est pas pour toi.", ephemeral=True)
-            return
-        await i.response.edit_message(content="💔 La demande a été refusée.", view=None)
-
-    btn_ok = discord.ui.Button(label="✅ Accepter", style=discord.ButtonStyle.success)
-    btn_no = discord.ui.Button(label="❌ Refuser", style=discord.ButtonStyle.danger)
-    btn_ok.callback = accepter_callback
-    btn_no.callback = refuser_callback
-    view.add_item(btn_ok)
-    view.add_item(btn_no)
-
-    await inter.response.send_message(embed=embed, view=view)
-
-@tree.command(name="famille_creer", description="Créer une nouvelle famille")
-async def famille_creer(inter: discord.Interaction, nom: str):
-    async with aiosqlite.connect(DB_PATH) as conn:
-        await conn.execute(
-            "INSERT INTO familles (nom, createur, date) VALUES (?,?,?)",
-            (nom, inter.user.id, int(time.time()))
-        )
-        await conn.commit()
-    await inter.response.send_message(f"👪 Famille **{nom}** créée avec succès !")
-
-@tree.command(name="contrathistorique", description="Voir l'historique de tes relations")
-async def contrathistorique(inter: discord.Interaction):
-    async with aiosqlite.connect(DB_PATH) as conn:
-        mariages = await (await conn.execute(
-            "SELECT user1,user2,date FROM mariages WHERE user1=? OR user2=?",
-            (inter.user.id, inter.user.id)
-        )).fetchall()
-        familles = await (await conn.execute(
-            "SELECT nom,date FROM familles WHERE createur=?",
-            (inter.user.id,)
-        )).fetchall()
-
-    desc = ""
-    if mariages:
-        for m in mariages:
-            u1, u2, d = m
-            partenaire = u2 if u1 == inter.user.id else u1
-            partenaire_tag = f"<@{partenaire}>"
-            desc += f"💍 Marié avec {partenaire_tag} depuis <t:{d}:D>\n"
-    if familles:
-        for f in familles:
-            nom, d = f
-            desc += f"👪 Famille **{nom}** créée le <t:{d}:D>\n"
-
-    if not desc:
-        desc = "Aucun contrat trouvé."
-    await inter.response.send_message(desc, ephemeral=True)
-
-# ---------- READY ----------
 @bot.event
 async def on_ready():
     await init_db()
     try:
         await tree.sync(guild=discord.Object(id=GUILD_ID))
-        print(f"✅ Commandes slash synchronisées sur {GUILD_ID}")
+        print("✅ Commandes slash synchronisées")
     except Exception as e:
-        print("⚠️ Erreur sync:", e)
-    print(f"🤖 Connecté en tant que {bot.user}")
-
-# ---------- MAIN ----------
-async def main():
-    async with bot:
-        await bot.start(DISCORD_TOKEN)
+        print("Erreur sync:", e)
+    print(f"Bot prêt: {bot.user}")
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    asyncio.run(bot.start(DISCORD_TOKEN))
